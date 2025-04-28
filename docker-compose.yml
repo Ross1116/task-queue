@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: local_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    networks:
+      - task_network
+
+  postgres:
+    image: postgres:latest
+    container_name: local_postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=your_db_user
+      - POSTGRES_PASSWORD=your_strong_password
+      - POSTGRES_DB=your_db_name
+    networks:
+      - task_network
+
+volumes:
+  rabbitmq_data: {}
+  postgres_data: {}
+
+networks:
+  task_network:
+    driver: bridge
