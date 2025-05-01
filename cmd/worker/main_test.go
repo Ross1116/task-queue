@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/Ross1116/task-queue/internal/task"
 
 	"github.com/pashagolub/pgxmock"
 	"github.com/stretchr/testify/assert"
@@ -15,6 +18,8 @@ import (
 type MockAcknowledger struct {
 	mock.Mock
 }
+
+var _ task.Acknowledger = (*MockAcknowledger)(nil)
 
 func (m *MockAcknowledger) Ack(multiple bool) error {
 	args := m.Called(multiple)
@@ -42,7 +47,7 @@ func TestUpdateTaskStatus_Completed(t *testing.T) {
 		WithArgs(status, result, taskID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
-	err = updateTaskStatus(mockPool, taskID, status, result)
+	err = updateTaskStatus(context.Background(), mockPool, taskID, status, result)
 	assert.NoError(t, err)
 }
 
@@ -61,7 +66,7 @@ func TestUpdateTaskStatus_Running(t *testing.T) {
 		WithArgs(status, taskID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
-	err = updateTaskStatus(mockPool, taskID, status, "")
+	err = updateTaskStatus(context.Background(), mockPool, taskID, status, "")
 	assert.NoError(t, err)
 }
 
@@ -81,7 +86,7 @@ func TestUpdateTaskStatus_Failed(t *testing.T) {
 		WithArgs(status, failReason, taskID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
-	err = updateTaskStatus(mockPool, taskID, status, failReason)
+	err = updateTaskStatus(context.Background(), mockPool, taskID, status, failReason)
 	assert.NoError(t, err)
 }
 
@@ -101,9 +106,9 @@ func TestUpdateTaskStatus_DBError(t *testing.T) {
 		WithArgs(status, taskID).
 		WillReturnError(dbError)
 
-	err = updateTaskStatus(mockPool, taskID, status, "")
+	err = updateTaskStatus(context.Background(), mockPool, taskID, status, "")
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), dbError.Error())
+	assert.ErrorIs(t, err, dbError)
 }
 
 func TestUpdateTaskStatus_NoRowsAffected(t *testing.T) {
@@ -122,7 +127,7 @@ func TestUpdateTaskStatus_NoRowsAffected(t *testing.T) {
 		WithArgs(status, result, taskID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 
-	err = updateTaskStatus(mockPool, taskID, status, result)
+	err = updateTaskStatus(context.Background(), mockPool, taskID, status, result)
 	assert.NoError(t, err)
 }
 
@@ -138,7 +143,7 @@ func TestProcessMessage_Success(t *testing.T) {
 
 	taskID := "proc-task-ok"
 	input := "some valid input"
-	taskMsg := TaskMessage{TaskID: taskID, Input: input}
+	taskMsg := task.TaskMessage{TaskID: taskID, Input: input}
 	body, _ := json.Marshal(taskMsg)
 
 	mockPool.ExpectExec("UPDATE tasks SET status = \\$1, updated_at = NOW\\(\\) WHERE task_id = \\$2").
@@ -162,7 +167,7 @@ func TestProcessMessage_UnmarshalError(t *testing.T) {
 	require.NoError(t, err)
 	mockAck := new(MockAcknowledger)
 	defer func() {
-		assert.NoError(t, mockPool.ExpectationsWereMet(), "DB should not be called on unmarshal error")
+		assert.NoError(t, mockPool.ExpectationsWereMet(), "DB should not be called")
 		mockPool.Close()
 		mockAck.AssertExpectations(t)
 	}()
@@ -172,7 +177,7 @@ func TestProcessMessage_UnmarshalError(t *testing.T) {
 	err = processMessage(mockPool, invalidBody, mockAck)
 
 	assert.Error(t, err, "processMessage should return error on unmarshal failure")
-	assert.Contains(t, err.Error(), "JSON unmarshal error", "Error message should indicate JSON failure")
+	assert.Contains(t, err.Error(), "JSON unmarshal error")
 }
 
 func TestProcessMessage_UpdateRunningError(t *testing.T) {
@@ -187,7 +192,7 @@ func TestProcessMessage_UpdateRunningError(t *testing.T) {
 
 	taskID := "proc-task-fail1"
 	input := "input data"
-	taskMsg := TaskMessage{TaskID: taskID, Input: input}
+	taskMsg := task.TaskMessage{TaskID: taskID, Input: input}
 	body, _ := json.Marshal(taskMsg)
 	dbError := errors.New("db connection failed")
 
@@ -198,8 +203,8 @@ func TestProcessMessage_UpdateRunningError(t *testing.T) {
 	err = processMessage(mockPool, body, mockAck)
 
 	assert.Error(t, err, "processMessage should return error on DB failure")
-	assert.Contains(t, err.Error(), "db update RUNNING error", "Error message should indicate RUNNING update failure")
-	assert.Contains(t, err.Error(), dbError.Error())
+	assert.Contains(t, err.Error(), "db update RUNNING error")
+	assert.ErrorIs(t, err, dbError)
 }
 
 func TestProcessMessage_UpdateCompletedError(t *testing.T) {
@@ -214,7 +219,7 @@ func TestProcessMessage_UpdateCompletedError(t *testing.T) {
 
 	taskID := "proc-task-fail2"
 	input := "input data"
-	taskMsg := TaskMessage{TaskID: taskID, Input: input}
+	taskMsg := task.TaskMessage{TaskID: taskID, Input: input}
 	body, _ := json.Marshal(taskMsg)
 	dbError := errors.New("cannot write result")
 
@@ -232,6 +237,6 @@ func TestProcessMessage_UpdateCompletedError(t *testing.T) {
 	err = processMessage(mockPool, body, mockAck)
 
 	assert.Error(t, err, "processMessage should return error on second DB failure")
-	assert.Contains(t, err.Error(), "db update COMPLETED error", "Error message should indicate COMPLETED update failure")
-	assert.ErrorIs(t, err, dbError, "Expected error '%v' to be wrapped", dbError)
+	assert.Contains(t, err.Error(), "db update COMPLETED error")
+	assert.ErrorIs(t, err, dbError)
 }
