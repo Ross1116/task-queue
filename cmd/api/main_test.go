@@ -289,4 +289,3 @@ func TestGetTaskStatusHandler_DatabaseError(t *testing.T) {
 	assert.Equal(t, "Failed to retrieve task status", errBody["error"], "Expected 'Failed to retrieve task status' error message")
 
 }
-

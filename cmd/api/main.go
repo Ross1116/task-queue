@@ -2,56 +2,25 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"github.com/Ross1116/task-queue/internal/task"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/streadway/amqp"
 )
-
-type DBTX interface {
-	Exec(ctx context.Context, sql string, arguments ...interface{}) (pgconn.CommandTag, error)
-	QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row
-}
-
-type QueuePublisher interface {
-	Publish(taskID string, input string) error
-	DeclareQueue() error
-	Close() error
-}
-
-type TaskStatusResponse struct {
-	TaskID    string         `json:"task_id"`
-	Status    string         `json:"status"`
-	Input     string         `json:"input,omitempty"`
-	Result    sql.NullString `json:"result"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
-}
-
-type CreateTaskRequest struct {
-	Input string `json:"input" binding:"required"`
-}
-
-type TaskMessage struct {
-	TaskID string `json:"task_id"`
-	Input  string `json:"input"`
-}
-
-type CreateTaskResponse struct {
-	TaskID string `json:"task_id"`
-}
 
 type RabbitMQPublisher struct {
 	conn    *amqp.Connection
@@ -83,23 +52,28 @@ func NewRabbitMQPublisher(url string) (*RabbitMQPublisher, error) {
 		return nil, err
 	}
 
-	log.Printf("Successfully connected to RabbitMQ and declared queue '%s'", taskQueueName)
+	log.Printf("INFO: Successfully connected to RabbitMQ and declared queue '%s'", task.TaskQueueName)
 	return publisher, nil
 }
 
 func (p *RabbitMQPublisher) DeclareQueue() error {
 	q, err := p.channel.QueueDeclare(
-		taskQueueName, true, false, false, false, nil,
+		task.TaskQueueName,
+		true,
+		false,
+		false,
+		false,
+		nil,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to declare queue '%s': %w", taskQueueName, err)
+		return fmt.Errorf("failed to declare queue '%s': %w", task.TaskQueueName, err)
 	}
 	p.queue = q
 	return nil
 }
 
 func (p *RabbitMQPublisher) Publish(taskID string, input string) error {
-	message := TaskMessage{
+	message := task.TaskMessage{
 		TaskID: taskID,
 		Input:  input,
 	}
@@ -109,14 +83,17 @@ func (p *RabbitMQPublisher) Publish(taskID string, input string) error {
 	}
 
 	err = p.channel.Publish(
-		"", p.queue.Name, false, false,
+		"",
+		p.queue.Name,
+		false,
+		false,
 		amqp.Publishing{
 			ContentType:  "application/json",
 			Body:         body,
 			DeliveryMode: amqp.Persistent,
 		})
 	if err != nil {
-		log.Printf("Failed to publish message, potential connection issue: %v", err)
+		log.Printf("ERROR: Failed to publish message for task %s: %v", taskID, err)
 		return fmt.Errorf("failed to publish message to queue '%s': %w", p.queue.Name, err)
 	}
 	return nil
@@ -125,60 +102,62 @@ func (p *RabbitMQPublisher) Publish(taskID string, input string) error {
 func (p *RabbitMQPublisher) Close() error {
 	var errChan, errConn error
 	if p.channel != nil {
+		log.Println("INFO: Closing RabbitMQ channel...")
 		errChan = p.channel.Close()
-		log.Println("RabbitMQ channel closed.")
 	}
 	if p.conn != nil {
+		log.Println("INFO: Closing RabbitMQ connection...")
 		errConn = p.conn.Close()
-		log.Println("RabbitMQ connection closed.")
 	}
 	if errChan != nil {
-		return fmt.Errorf("error closing channel: %w", errChan)
+		return fmt.Errorf("error closing RabbitMQ channel: %w", errChan)
 	}
 	if errConn != nil {
-		return fmt.Errorf("error closing connection: %w", errConn)
+		return fmt.Errorf("error closing RabbitMQ connection: %w", errConn)
 	}
+	log.Println("INFO: RabbitMQ resources closed.")
 	return nil
 }
 
 type Application struct {
-	DB        DBTX
-	Publisher QueuePublisher
+	DB        task.DBTX
+	Publisher task.QueuePublisher
 }
-
-const (
-	rabbitMQURLKey = "RABBITMQ_URL"
-	databaseURLKey = "DATABASE_URL"
-	portKey        = "PORT"
-	taskQueueName  = "task_queue"
-)
 
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Println("No .env file found, reading environment variables directly")
+		log.Println("INFO: No .env file found, reading environment variables directly.")
 	}
 
-	rabbitMQURL := getEnv(rabbitMQURLKey, "amqp://guest:guest@localhost:5672/")
-	databaseURL := getEnv(databaseURLKey, "")
-	port := getEnv(portKey, "8080")
+	rabbitMQURL := task.GetEnv(task.RabbitMQURLKey, "amqp://guest:guest@localhost:5672/")
+	databaseURL := task.GetEnv(task.DatabaseURLKey, "")
+	port := task.GetEnv(task.PortKey, "8080")
 
-	log.Printf("RabbitMQ URL: %s", rabbitMQURL)
+	log.Printf("INFO: API Service starting...")
+	log.Printf("INFO: RabbitMQ URL: %s", rabbitMQURL)
+	log.Printf("INFO: Database URL: %s", databaseURL)
+	log.Printf("INFO: Port: %s", port)
 
 	if databaseURL == "" {
-		log.Fatalf("FATAL: %s environment variable not set.", databaseURLKey)
+		log.Fatalf("FATAL: %s environment variable not set.", task.DatabaseURLKey)
 	}
 
-	dbpool, err := pgxpool.Connect(context.Background(), databaseURL)
+	dbCtx := context.Background()
+	dbpool, err := pgxpool.Connect(dbCtx, databaseURL)
 	if err != nil {
-		log.Fatalf("Unable to connect to database: %v\n", err)
+		log.Fatalf("FATAL: Unable to connect to database: %v", err)
 	}
-	defer dbpool.Close()
-	log.Println("Successfully connected to PostgreSQL.")
+	defer func() {
+		log.Println("INFO: Closing database pool...")
+		dbpool.Close()
+		log.Println("INFO: Database pool closed.")
+	}()
+	log.Println("INFO: Successfully connected to PostgreSQL.")
 
 	publisher, err := NewRabbitMQPublisher(rabbitMQURL)
 	if err != nil {
-		log.Fatalf("Failed to initialize RabbitMQ publisher: %v", err)
+		log.Fatalf("FATAL: Failed to initialize RabbitMQ publisher: %v", err)
 	}
 	defer publisher.Close()
 
@@ -191,63 +170,80 @@ func main() {
 
 	router.POST("/tasks", app.createTaskHandler)
 	router.GET("/tasks/:id/status", app.getTaskStatusHandler)
+	router.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
 
 	serverAddr := ":" + port
-	log.Printf("Starting API server on %s", serverAddr)
-	if err := router.Run(serverAddr); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	srv := &http.Server{
+		Addr:    serverAddr,
+		Handler: router,
 	}
-}
 
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		log.Println("INFO: Shutdown signal received, initiating graceful shutdown...")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Fatalf("FATAL: Server forced to shutdown: %v", err)
+		}
+		log.Println("INFO: HTTP server gracefully stopped.")
+	}()
+
+	log.Printf("INFO: Starting API server on %s", serverAddr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("FATAL: Failed to start server: %v", err)
 	}
-	if fallback != "" {
-		log.Printf("Using default value for %s: %s", key, fallback)
-	}
-	return fallback
+
+	log.Println("INFO: API Service shut down complete.")
+
 }
 
 func (app *Application) createTaskHandler(c *gin.Context) {
-	var req CreateTaskRequest
+	var req task.CreateTaskRequest
+
 	if err := c.ShouldBindJSON(&req); err != nil {
-		log.Printf("Error binding JSON: %v", err)
+		log.Printf("WARN: createTaskHandler - Error binding JSON: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body: " + err.Error()})
 		return
 	}
 
-	taskID := uuid.New().String()
-	log.Printf("Generated TaskID: %s for input: %s", taskID, req.Input)
+	taskID := uuid.NewString()
+	log.Printf("INFO: createTaskHandler - Generated TaskID: %s for input: %s", taskID, req.Input)
 
 	status := "PENDING"
 	insertSQL := `INSERT INTO tasks (task_id, status, task_input) VALUES ($1, $2, $3)`
-	_, err := app.DB.Exec(context.Background(), insertSQL, taskID, status, req.Input)
+	_, err := app.DB.Exec(c.Request.Context(), insertSQL, taskID, status, req.Input)
 	if err != nil {
-		log.Printf("Error inserting task %s into database: %v", taskID, err)
+		log.Printf("ERROR: createTaskHandler - Error inserting task %s into database: %v", taskID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create task record"})
 		return
 	}
-	log.Printf("Successfully inserted task %s into database with status PENDING", taskID)
+	log.Printf("INFO: createTaskHandler - Inserted task %s with status PENDING", taskID)
 
 	err = app.Publisher.Publish(taskID, req.Input)
 	if err != nil {
-		log.Printf("Error publishing task %s to RabbitMQ: %v", taskID, err)
+		log.Printf("ERROR: createTaskHandler - Failed to publish task %s to queue.", taskID)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Task created but failed to queue for processing"})
 		return
 	}
-	log.Printf("Successfully published task %s to RabbitMQ queue '%s'", taskID, taskQueueName)
+	log.Printf("INFO: createTaskHandler - Published task %s to queue '%s'", taskID, task.TaskQueueName)
 
-	c.JSON(http.StatusAccepted, CreateTaskResponse{TaskID: taskID})
+	c.JSON(http.StatusAccepted, task.CreateTaskResponse{TaskID: taskID})
 }
 
 func (app *Application) getTaskStatusHandler(c *gin.Context) {
 	taskIDParam := c.Param("id")
-	log.Printf("Received GET /tasks/%s/status request", taskIDParam)
+	log.Printf("INFO: getTaskStatusHandler - Received request for TaskID: %s", taskIDParam)
 
 	_, err := uuid.Parse(taskIDParam)
 	if err != nil {
-		log.Printf("Invalid Task ID format: %s, error: %v", taskIDParam, err)
+		log.Printf("WARN: getTaskStatusHandler - Invalid Task ID format: %s, error: %v", taskIDParam, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Task ID format"})
 		return
 	}
@@ -257,42 +253,30 @@ func (app *Application) getTaskStatusHandler(c *gin.Context) {
         FROM tasks
         WHERE task_id = $1
     `
-	var status string
-	var input string
-	var result sql.NullString
-	var createdAt time.Time
-	var updatedAt time.Time
+	var resp task.TaskStatusResponse
+	resp.TaskID = taskIDParam
 
-	ctx := c.Request.Context()
-	err = app.DB.QueryRow(ctx, selectSQL, taskIDParam).Scan(
-		&status,
-		&input,
-		&result,
-		&createdAt,
-		&updatedAt,
+	err = app.DB.QueryRow(c.Request.Context(), selectSQL, taskIDParam).Scan(
+		&resp.Status,
+		&resp.Input,
+		&resp.Result,
+		&resp.CreatedAt,
+		&resp.UpdatedAt,
 	)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			log.Printf("Task ID %s not found in database", taskIDParam)
+			log.Printf("INFO: getTaskStatusHandler - Task ID %s not found", taskIDParam)
 			c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
 		} else {
-			log.Printf("Error querying task status for ID %s: %v", taskIDParam, err)
+			log.Printf("ERROR: getTaskStatusHandler - Error querying task status for ID %s: %v", taskIDParam, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve task status"})
 		}
 		return
 	}
 
-	response := TaskStatusResponse{
-		TaskID:    taskIDParam,
-		Status:    status,
-		Input:     input,
-		Result:    result,
-		CreatedAt: createdAt,
-		UpdatedAt: updatedAt,
-	}
-
-	log.Printf("Successfully retrieved status for task %s: Status=%s", taskIDParam, status)
-	c.JSON(http.StatusOK, response)
+	log.Printf("INFO: getTaskStatusHandler - Successfully retrieved status for task %s: Status=%s", taskIDParam, resp.Status)
+	c.JSON(http.StatusOK, resp)
 }
 
+var _ task.QueuePublisher = (*RabbitMQPublisher)(nil)

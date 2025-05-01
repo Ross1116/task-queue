@@ -235,4 +235,3 @@ func TestProcessMessage_UpdateCompletedError(t *testing.T) {
 	assert.Contains(t, err.Error(), "db update COMPLETED error", "Error message should indicate COMPLETED update failure")
 	assert.ErrorIs(t, err, dbError, "Expected error '%v' to be wrapped", dbError)
 }
-
