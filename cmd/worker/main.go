@@ -8,21 +8,35 @@ import (
 	"os"
 	"time"
 
+	"github.com/jackc/pgconn"
+	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/streadway/amqp"
 )
+
+type DBTX interface {
+	Exec(ctx context.Context, sql string, arguments ...interface{}) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row
+}
+
+type Acknowledger interface {
+	Ack(multiple bool) error
+	Nack(multiple bool, requeue bool) error
+}
+
+var sleepFunc = time.Sleep
+
+type TaskMessage struct {
+	TaskID string `json:"task_id"`
+	Input  string `json:"input"`
+}
 
 const (
 	rabbitMQURLKey = "RABBITMQ_URL"
 	databaseURLKey = "DATABASE_URL"
 	taskQueueName  = "task_queue"
 )
-
-type TaskMessage struct {
-	TaskID string `json:"task_id"`
-	Input  string `json:"input"`
-}
 
 func getEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
@@ -77,13 +91,10 @@ func main() {
 	failOnError(err, fmt.Sprintf("Failed to declare queue '%s'", taskQueueName))
 	log.Printf("INFO: Queue '%s' declared successfully", q.Name)
 
-	err = ch.Qos(
-		1,
-		0,
-		false,
-	)
+	prefetchCount := 1
+	err = ch.Qos(prefetchCount, 0, false)
 	failOnError(err, "Failed to set QoS")
-	log.Println("INFO: QoS Prefetch Count set to 1")
+	log.Printf("INFO: QoS Prefetch Count set to %d", prefetchCount)
 
 	msgs, err := ch.Consume(
 		q.Name, "", false, false, false, false, nil,
@@ -93,46 +104,24 @@ func main() {
 
 	forever := make(chan bool)
 
-	go func(db *pgxpool.Pool) {
+	go func(db DBTX) {
 		for d := range msgs {
-			log.Printf("==> Received message (delivery tag %d): %s", d.DeliveryTag, d.Body)
-
-			var taskMsg TaskMessage
-			err := json.Unmarshal(d.Body, &taskMsg)
+			err := processMessage(db, d.Body, &d)
 			if err != nil {
-				log.Printf("ERROR: Failed to parse message JSON (%s): %v", d.Body, err)
-				continue
-			}
-			log.Printf("INFO: Processing task %s (Input: %s)", taskMsg.TaskID, taskMsg.Input)
-
-			err = updateTaskStatus(db, taskMsg.TaskID, "RUNNING", "")
-			if err != nil {
-				log.Printf("ERROR: Failed to update task %s status to RUNNING: %v", taskMsg.TaskID, err)
-				continue
-			}
-			log.Printf("INFO: Task %s status updated to RUNNING", taskMsg.TaskID)
-
-			processingTime := 5 * time.Second
-			log.Printf("INFO: Task %s simulating work for %v...", taskMsg.TaskID, processingTime)
-			time.Sleep(processingTime)
-			log.Printf("INFO: Task %s work simulation complete.", taskMsg.TaskID)
-
-			simulatedResult := fmt.Sprintf("Processed input: '%s' successfully after %v", taskMsg.Input, processingTime)
-			err = updateTaskStatus(db, taskMsg.TaskID, "COMPLETED", simulatedResult)
-			if err != nil {
-				log.Printf("ERROR: Failed to update task %s status to COMPLETED: %v", taskMsg.TaskID, err)
-				continue
-			}
-			log.Printf("INFO: Task %s status updated to COMPLETED", taskMsg.TaskID)
-
-			log.Printf("INFO: Acknowledging message for task %s (delivery tag %d)", taskMsg.TaskID, d.DeliveryTag)
-			err = d.Ack(false)
-			if err != nil {
-				log.Printf("ERROR: Failed to acknowledge message for task %s (delivery tag %d): %v", taskMsg.TaskID, d.DeliveryTag, err)
+				log.Printf("ERROR: Failed to process message (delivery tag %d): %v. Message will be Nacked.", d.DeliveryTag, err)
+				nackErr := d.Nack(false, false)
+				if nackErr != nil {
+					log.Printf("ERROR: Failed to Nack message (delivery tag %d): %v", d.DeliveryTag, nackErr)
+				}
 			} else {
-				log.Printf("INFO: Message acknowledged successfully for task %s.", taskMsg.TaskID)
+				log.Printf("INFO: Acknowledging message (delivery tag %d)", d.DeliveryTag)
+				ackErr := d.Ack(false)
+				if ackErr != nil {
+					log.Printf("ERROR: Failed to acknowledge message (delivery tag %d): %v", d.DeliveryTag, ackErr)
+				} else {
+					log.Printf("INFO: Message acknowledged successfully (delivery tag %d).", d.DeliveryTag)
+				}
 			}
-
 		}
 		log.Println("INFO: RabbitMQ consumption channel closed. Exiting processing goroutine.")
 		close(forever)
@@ -142,27 +131,67 @@ func main() {
 	log.Println("INFO: Worker shutting down.")
 }
 
-func updateTaskStatus(db *pgxpool.Pool, taskID string, status string, result string) error {
-	var sql string
-	var args []any
+func processMessage(db DBTX, body []byte, ack Acknowledger) error {
+	log.Printf("==> Processing raw message: %s", body)
 
-	if status == "COMPLETED" && result != "" {
+	var taskMsg TaskMessage
+	err := json.Unmarshal(body, &taskMsg)
+	if err != nil {
+		log.Printf("ERROR: Failed to parse message JSON (%s): %v", body, err)
+		return fmt.Errorf("JSON unmarshal error: %w", err)
+	}
+	log.Printf("INFO: Processing task %s (Input: %s)", taskMsg.TaskID, taskMsg.Input)
+
+	err = updateTaskStatus(db, taskMsg.TaskID, "RUNNING", "")
+	if err != nil {
+		log.Printf("ERROR: Failed to update task %s status to RUNNING: %v", taskMsg.TaskID, err)
+		return fmt.Errorf("db update RUNNING error: %w", err)
+	}
+	log.Printf("INFO: Task %s status updated to RUNNING", taskMsg.TaskID)
+
+	processingTime := 5 * time.Second
+	log.Printf("INFO: Task %s simulating work for %v...", taskMsg.TaskID, processingTime)
+	sleepFunc(processingTime)
+	log.Printf("INFO: Task %s work simulation complete.", taskMsg.TaskID)
+	simulatedResult := fmt.Sprintf("Processed input: '%s' successfully after %v", taskMsg.Input, processingTime)
+
+	err = updateTaskStatus(db, taskMsg.TaskID, "COMPLETED", simulatedResult)
+	if err != nil {
+		log.Printf("ERROR: Failed to update task %s status to COMPLETED: %v", taskMsg.TaskID, err)
+		return fmt.Errorf("db update COMPLETED error: %w", err)
+	}
+	log.Printf("INFO: Task %s status updated to COMPLETED with result.", taskMsg.TaskID)
+
+	log.Printf("INFO: Task %s processed successfully.", taskMsg.TaskID)
+	return nil
+}
+
+func updateTaskStatus(db DBTX, taskID string, status string, result string) error {
+	var sql string
+	var args []interface{}
+
+	if status == "COMPLETED" {
 		sql = `UPDATE tasks SET status = $1, result = $2, updated_at = NOW() WHERE task_id = $3`
-		args = []any{status, result, taskID}
+		args = []interface{}{status, result, taskID}
+	} else if status == "FAILED" {
+		sql = `UPDATE tasks SET status = $1, result = $2, updated_at = NOW() WHERE task_id = $3`
+		args = []interface{}{status, result, taskID}
 	} else {
 		sql = `UPDATE tasks SET status = $1, updated_at = NOW() WHERE task_id = $2`
-		args = []any{status, taskID}
+		args = []interface{}{status, taskID}
 	}
 
 	cmdTag, err := db.Exec(context.Background(), sql, args...)
 	if err != nil {
-		return fmt.Errorf("database exec error: %w", err)
+		return fmt.Errorf("database exec error updating task %s to %s: %w", taskID, status, err)
 	}
 
 	if cmdTag.RowsAffected() == 0 {
-		log.Printf("WARN: Attempted to update status for task %s, but no rows were affected.", taskID)
+		log.Printf("WARN: Attempted to update status for task %s to %s, but no rows were affected (task may not exist?).", taskID, status)
 	}
 
 	return nil
 }
+
+var _ Acknowledger = (*amqp.Delivery)(nil)
 
