@@ -145,7 +145,7 @@ func TestProcessMessage_Success(t *testing.T) {
 		WithArgs("RUNNING", taskID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mockPool.ExpectExec("UPDATE tasks SET status = \\$1, result = \\$2, updated_at = NOW\\(\\) WHERE task_id = \\$3").
-		WithArgs("COMPLETED", mock.AnythingOfType("string"), taskID).
+		WithArgs("COMPLETED", pgxmock.AnyArg(), taskID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
 	originalSleepFunc := sleepFunc
@@ -222,7 +222,7 @@ func TestProcessMessage_UpdateCompletedError(t *testing.T) {
 		WithArgs("RUNNING", taskID).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mockPool.ExpectExec("UPDATE tasks SET status = \\$1, result = \\$2, updated_at = NOW\\(\\) WHERE task_id = \\$3").
-		WithArgs("COMPLETED", mock.AnythingOfType("string"), taskID).
+		WithArgs("COMPLETED", pgxmock.AnyArg(), taskID).
 		WillReturnError(dbError)
 
 	originalSleepFunc := sleepFunc
@@ -233,6 +233,6 @@ func TestProcessMessage_UpdateCompletedError(t *testing.T) {
 
 	assert.Error(t, err, "processMessage should return error on second DB failure")
 	assert.Contains(t, err.Error(), "db update COMPLETED error", "Error message should indicate COMPLETED update failure")
-	assert.Contains(t, err.Error(), dbError.Error())
+	assert.ErrorIs(t, err, dbError, "Expected error '%v' to be wrapped", dbError)
 }
 
