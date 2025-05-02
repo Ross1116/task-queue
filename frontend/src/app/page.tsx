@@ -1,4 +1,5 @@
 "use client";
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { TaskStatus } from '@/lib/apiClient';
 import { TaskForm } from '@/components/TaskForm';
@@ -11,22 +12,56 @@ export default function HomePage() {
   const [isLoadingStatus, setIsLoadingStatus] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const isMounted = useRef(true);
+
+  const stopPolling = useCallback((taskId: string | null, reason: string) => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+      console.log(`Polling stopped for task ${taskId || 'N/A'}: ${reason}`);
+    }
+  }, []);
+
+  const fetchStatus = useCallback(async (taskId: string | null) => {
+    if (!taskId) return;
+    setIsLoadingStatus(true);
+    try {
+      const statusData = await getTaskStatus(taskId);
+      if (isMounted.current) {
+        setTaskStatus(statusData);
+        setError(null);
+        const upperStatus = statusData.status?.toUpperCase();
+        if (upperStatus === 'COMPLETED' || upperStatus === 'FAILED') {
+          stopPolling(taskId, `Terminal state reached (${statusData.status})`);
+        }
+      }
+    } catch (err: any) {
+      console.error("Error in fetchStatus:", err);
+      if (isMounted.current) {
+        setError(err.message || "Failed to fetch status.");
+        if (err.message === 'Task not found') {
+          stopPolling(taskId, 'Task not found');
+        }
+      }
+    } finally {
+      if (isMounted.current) {
+        setIsLoadingStatus(false);
+      }
+    }
+  }, [stopPolling]);
+
   const handleTaskSubmit = async (input: string) => {
     setIsSubmitting(true);
     setError(null);
     setTaskStatus(null);
     setCurrentTaskId(null);
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
+    stopPolling(currentTaskId, "New task submitted");
     try {
       const data = await submitTask(input);
       if (isMounted.current) {
         setCurrentTaskId(data.task_id);
-        fetchStatus(data.task_id);
       }
     } catch (err: any) {
       if (isMounted.current) {
@@ -38,64 +73,25 @@ export default function HomePage() {
       }
     }
   };
-  const fetchStatus = useCallback(async (taskId: string | null) => {
-    if (!taskId) return;
-    if (isLoadingStatus) return;
-    setIsLoadingStatus(true);
-    setError(null);
-    try {
-      const statusData = await getTaskStatus(taskId);
-      if (isMounted.current) {
-        setTaskStatus(statusData);
-        if (statusData.status === 'COMPLETED' || statusData.status === 'FAILED') {
-          if (intervalRef.current) {
-            clearInterval(intervalRef.current);
-            intervalRef.current = null;
-            console.log(`Polling stopped for task ${taskId} with status ${statusData.status}`);
-          }
-        }
-      }
-    } catch (err: any) {
-      console.error("Error in fetchStatus:", err);
-      if (isMounted.current) {
-        setError(err.message || "Failed to fetch status.");
-        if (err.message === 'Task not found' && intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-          console.log(`Polling stopped for task ${taskId}: Task not found.`);
-        }
-      }
-    } finally {
-      if (isMounted.current) {
-        setIsLoadingStatus(false);
-      }
-    }
-  }, [isLoadingStatus]);
+
   useEffect(() => {
     isMounted.current = true;
-    const startPolling = (taskId: string) => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
-      }
-      console.log(`Starting polling for task ${taskId}...`);
-      fetchStatus(taskId);
-      intervalRef.current = setInterval(() => {
-        console.log(`Polling status for task ${taskId}...`);
-        fetchStatus(taskId);
-      }, 3000);
-    };
     if (currentTaskId) {
-      startPolling(currentTaskId);
+      console.log(`Effect: Starting polling for task ${currentTaskId}...`);
+      fetchStatus(currentTaskId);
+      intervalRef.current = setInterval(() => {
+        console.log(`Polling status for task ${currentTaskId}...`);
+        fetchStatus(currentTaskId);
+      }, 1000);
+    } else {
+      stopPolling(null, "Task ID cleared");
     }
     return () => {
       isMounted.current = false;
-      if (intervalRef.current) {
-        console.log("Clearing polling interval on unmount.");
-        clearInterval(intervalRef.current);
-        intervalRef.current = null;
-      }
+      stopPolling(currentTaskId, "Component unmounting");
     };
-  }, [currentTaskId, fetchStatus]);
+  }, [currentTaskId, fetchStatus, stopPolling]);
+
   return (
     <main className="flex min-h-screen flex-col items-center justify-start p-6 sm:p-12 md:p-24 bg-gray-50 font-sans">
       <div className="z-10 w-full max-w-2xl items-center justify-between text-sm lg:flex flex-col">
@@ -114,7 +110,7 @@ export default function HomePage() {
           <TaskStatusDisplay
             taskStatus={taskStatus}
             isLoading={isLoadingStatus}
-            error={error && taskStatus ? error : null}
+            error={error}
           />
         </div>
       </div>

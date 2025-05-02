@@ -33,7 +33,7 @@ export const TaskForm: React.FC<TaskFormProps> = ({ onSubmit, isSubmitting }) =>
 					id="taskInput"
 					name="taskInput"
 					rows={3}
-					className="shadow-sm focus:ring-blue-500 focus:border-blue-500 block w-full sm:text-sm border border-gray-300 rounded-md p-2"
+					className="shadow-sm focus:ring-blue-500 focus:border-blue-500 block w-full sm:text-sm border border-gray-300 rounded-md p-2 text-gray-600"
 					placeholder="Enter data to process..."
 					value={inputValue}
 					onChange={(e) => setInputValue(e.target.value)}
