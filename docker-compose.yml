@@ -14,6 +14,7 @@ services:
       - RABBITMQ_DEFAULT_PASS=guest
     networks:
       - task_network
+    restart: unless-stopped
 
   postgres:
     image: postgres:latest
@@ -28,6 +29,42 @@ services:
       - POSTGRES_DB=your_db_name
     networks:
       - task_network
+    restart: unless-stopped
+
+  api:
+    container_name: taskqueue-api
+    build:
+      context: .
+      dockerfile: cmd/api/Dockerfile
+    ports:
+      - "${API_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: "postgres://your_db_user:your_strong_password@local_postgres:5432/your_db_name?sslmode=disable"
+      RABBITMQ_URL: "amqp://guest:guest@local_rabbitmq:5672/"
+      PORT: "8080"
+      GIN_MODE: "${GIN_MODE:-debug}"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}"
+    networks:
+      - task_network
+    depends_on:
+      - postgres
+      - rabbitmq
+    restart: unless-stopped
+
+  worker:
+    container_name: taskqueue-worker
+    build:
+      context: .
+      dockerfile: cmd/worker/Dockerfile
+    environment:
+      DATABASE_URL: "postgres://your_db_user:your_strong_password@local_postgres:5432/your_db_name?sslmode=disable"
+      RABBITMQ_URL: "amqp://guest:guest@local_rabbitmq:5672/"
+    networks:
+      - task_network
+    depends_on:
+      - postgres
+      - rabbitmq
+    restart: unless-stopped
 
 volumes:
   rabbitmq_data: {}
