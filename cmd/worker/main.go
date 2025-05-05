@@ -200,4 +200,3 @@ func updateTaskStatus(ctx context.Context, db task.DBTX, taskID string, status s
 }
 
 var _ task.Acknowledger = (*amqp.Delivery)(nil)
-
